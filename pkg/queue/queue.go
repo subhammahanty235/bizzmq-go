@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/subhammahanty235/pkg/storage"
+	"github.com/subhammahanty235/bizzmq-go/pkg/storage"
 )
 
 type BizzMQ struct {

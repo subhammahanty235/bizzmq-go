@@ -1,4 +1,4 @@
-module github.com/subhammahanty235
+module github.com/subhammahanty235/bizzmq-go
 
 go 1.22.3
 
