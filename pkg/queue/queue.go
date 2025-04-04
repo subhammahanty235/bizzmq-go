@@ -176,7 +176,7 @@ func (b *BizzMQ) RetryDeadLetterMessage(ctx context.Context, queuename string, m
 				return false, fmt.Errorf("failed to publish message to DLQ")
 			}
 
-			fmt.Println("🔄 Message %s moved from DLQ back to \"%s\"\n", messageId, queuename)
+			fmt.Printf("🔄 Message %s moved from DLQ back to \"%s\"\n", messageId, queuename)
 			return true, nil
 
 		}
