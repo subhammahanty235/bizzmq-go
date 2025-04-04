@@ -1,4 +1,4 @@
-package queue
+package bizzmq
 
 /*
 		this.message_id = message_id

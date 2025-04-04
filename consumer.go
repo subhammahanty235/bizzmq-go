@@ -1,4 +1,4 @@
-package queue
+package bizzmq
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"log"
 	"runtime/debug"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -20,14 +19,13 @@ func (b *BizzMQ) ConsumeMessageFromQueue(ctx context.Context, queuename string, 
 	if queuename == "" {
 		return nil, fmt.Errorf("❌ Queue name not provided")
 	}
-	queueMetaKey := fmt.Sprintf("queue_meta:%s", queuename)
+
 	queueKey := fmt.Sprintf("queue:%s", queuename)
-	redisClientInstance := b.redis.GetRedisClient()
+	queueMetaKey := fmt.Sprintf("queue_meta:%s", queuename)
 
-	//Create an instance for subscriber
-	subscriber := redis.NewClient(b.redis.GetRedisClient().Options())
-
-	queueOptionsMap, err := redisClientInstance.HGetAll(ctx, queueMetaKey).Result()
+	redisClient := b.redis.GetRedisClient()
+	subscriber := redis.NewClient(redisClient.Options())
+	queueOptionsMap, err := redisClient.HGetAll(ctx, queueMetaKey).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queue options: %w", err)
 	}
@@ -35,44 +33,50 @@ func (b *BizzMQ) ConsumeMessageFromQueue(ctx context.Context, queuename string, 
 	deadLetterQueueValue := queueOptionsMap["dead_letter_queue"]
 	useDeadLetterQueue := deadLetterQueueValue == "true" || deadLetterQueueValue == "1"
 
-	maxRetries := 3 //Default value is 3
+	maxRetries := 3 // Default value for the retries, TODO: Better approach *
 	if maxRetriesStr, ok := queueOptionsMap["maxRetries"]; ok {
 		if val, err := strconv.Atoi(maxRetriesStr); err == nil {
 			maxRetries = val
 		}
 	}
 
-	consumerCtx, cancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
-
-	processMessage := func(messageStr string) {
-		var parsedMessage map[string]interface{}
-		if err := json.Unmarshal([]byte(messageStr), &parsedMessage); err != nil {
-			log.Printf("❌ Failed to parse message: %v", err)
-			return
+	// This function will process the jobs/messages
+	processJob := func(message string) error {
+		if message == "" {
+			return nil
 		}
 
+		var parsedMessage map[string]interface{}
+		if err := json.Unmarshal([]byte(message), &parsedMessage); err != nil {
+			log.Printf("❌ Failed to parse message: %v", err)
+			return err
+		}
+
+		// now it will process the callback function recieved from the client end
 		if err := callback(parsedMessage); err != nil {
 			if useDeadLetterQueue {
 				if maxRetries > 0 {
-					if err := b.requeueMessage(consumerCtx, queuename, messageStr, err); err != nil {
+					if err := b.requeueMessage(ctx, queuename, message, err); err != nil {
 						log.Printf("❌ Error retrying message: %v", err)
 					}
 				} else {
-					if err := b.moveMessageToDLQ(consumerCtx, queuename, messageStr, err); err != nil {
+					if err := b.moveMessageToDLQ(ctx, queuename, message, err); err != nil {
 						log.Printf("❌ Error moving message to DLQ: %v", err)
 					}
 				}
 			} else {
 				log.Printf("⚠️ Message failed but no DLQ configured")
 			}
+			return err
 		}
+
+		return nil
 	}
 
+	// we will check if any existing messages are there in the queue for processing, we will process them first
 	processExistingJobs := func() {
 		for {
-			// Pop message from queue
-			messageStr, err := redisClientInstance.RPop(consumerCtx, queueKey).Result()
+			message, err := redisClient.RPop(ctx, queueKey).Result()
 			if err != nil {
 				if err != redis.Nil {
 					log.Printf("❌ Error popping message from queue: %v", err)
@@ -80,75 +84,64 @@ func (b *BizzMQ) ConsumeMessageFromQueue(ctx context.Context, queuename string, 
 				break
 			}
 
-			processMessage(messageStr)
+			if err := processJob(message); err != nil {
+				log.Printf("❌ Error processing message: %v", err)
+			}
 		}
 	}
 
 	processExistingJobs()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	pubsub := subscriber.Subscribe(ctx, queueKey)
 
-		pubsub := subscriber.Subscribe(consumerCtx, queueKey)
+	// go routine for start checking for messages
+	go func() {
 		defer pubsub.Close()
 
-		// Wait for confirmation of subscription
-		_, err := pubsub.Receive(consumerCtx)
-		if err != nil {
-			log.Printf("❌ Failed to subscribe: %v", err)
-			return
-		}
+		channel := pubsub.Channel()
+		for msg := range channel {
+			log.Printf("🔔 New job notification received: %s", msg.Payload)
 
-		// Start receiving messages
-		ch := pubsub.Channel()
-		for {
-			select {
-			case msg := <-ch:
-				fmt.Printf("🔔 New job notification received: %s\n", msg.Payload)
-				messageStr, err := redisClientInstance.RPop(consumerCtx, queueKey).Result()
-				if err == nil {
-					processMessage(messageStr)
-				} else if err != redis.Nil {
-					log.Printf("❌ Error popping message after notification: %v", err)
+			//queue mechanism to pop and process one message
+			message, err := redisClient.RPop(ctx, queueKey).Result()
+			if err == nil {
+				if err := processJob(message); err != nil {
+					log.Printf("❌ Error processing message: %v", err)
 				}
-			case <-consumerCtx.Done():
-				return
+			} else if err != redis.Nil {
+				log.Printf("❌ Error popping message after notification: %v", err)
 			}
 		}
 	}()
 
+	//interval timer
 	fallbackTicker := time.NewTicker(5 * time.Second)
-	wg.Add(1)
+
 	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-fallbackTicker.C:
-				messageStr, err := redisClientInstance.RPop(consumerCtx, queueKey).Result()
-				if err == nil {
-					fmt.Println("⚠️ Fallback found unprocessed job")
-					processMessage(messageStr)
-					processExistingJobs()
-				} else if err != redis.Nil {
-					log.Printf("❌ Error in fallback check: %v", err)
+		for range fallbackTicker.C {
+			message, err := redisClient.RPop(ctx, queueKey).Result()
+			if err == nil {
+				log.Printf("⚠️ Fallback found unprocessed job")
+
+				if err := processJob(message); err != nil {
+					log.Printf("❌ Error processing message from fallback: %v", err)
 				}
-			case <-consumerCtx.Done():
-				return
+
+				processExistingJobs()
+			} else if err != redis.Nil {
+				log.Printf("❌ Error in fallback check: %v", err)
 			}
 		}
 	}()
 
-	fmt.Printf("📡 Listening for jobs on %s...\n", queuename)
+	log.Printf("📡 Listening for jobs on %s...", queuename)
 
-	// Return cleanup function
+	//cleanup funcrions
 	return func() {
-		cancel()              // Cancel the context to stop all operations
-		fallbackTicker.Stop() // Stop the ticker
-		wg.Wait()             // Wait for all goroutines to finish
+		fallbackTicker.Stop()
+		pubsub.Close()
 		subscriber.Close()
 	}, nil
-
 }
 
 func (b *BizzMQ) requeueMessage(ctx context.Context, queuename, message interface{}, processingErr error) error {

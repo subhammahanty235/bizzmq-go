@@ -1,4 +1,4 @@
-package queue
+package bizzmq
 
 import (
 	"context"
