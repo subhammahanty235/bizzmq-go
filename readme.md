@@ -1,17 +1,16 @@
-# BizzMQ-G0
+# BizzMQ-Go
 
-A lightweight Redis-based message queue with Dead Letter Queue support, implemented in Go
+A lightweight Redis-based message queue system with Dead Letter Queue support, implemented in Go.
 
 ## Features
 
-- **Simple Redis-Based Queue**: Leverage the power and reliability of Redis for message storage and processing
-- **Real-Time Processing**: Utilizes Redis Pub/Sub for immediate job notification with fallback polling
-- **Dead Letter Queue**: Automatic handling of failed messages with configurable DLQ
+- **Simple Redis-Based Queue**: Leverages Redis for reliable message storage and processing
+- **Real-Time Processing**: Uses Redis Pub/Sub for immediate job notification with fallback polling
+- **Dead Letter Queue**: Automatically handles failed messages with configurable DLQ
 - **Retry Mechanism**: Configurable retry attempts for failed jobs before they're moved to DLQ
 - **Message Persistence**: Jobs are safely stored in Redis until successfully processed
-- **Low Overhead**: Minimal dependencies and lightweight design for optimal performance
-- **Error Handling**: Robust error handling with detailed error tracking in failed messages
-- **Go Idiomatic Design**: Follows Go best practices including context support, interfaces, and proper error handling
+- **Error Handling**: Robust error management with detailed tracking in failed messages
+- **Go Idiomatic Design**: Follows Go best practices with context support and proper error handling
 - **Concurrency Support**: Leverages Go's goroutines for efficient parallel processing
 
 ## Installation
@@ -22,7 +21,7 @@ go get github.com/subhammahanty235/bizzmq-go
 
 ## Prerequisites
 
-- Go 1.18 or higher
+- Go 1.18+ (tested with Go 1.22.3)
 - Redis server (v5 or higher)
 
 ## Quick Start
@@ -36,14 +35,16 @@ import (
     "context"
     "fmt"
     "log"
-    "time"
+    "os"
+    "os/signal"
+    "syscall"
 
-    "github.com/yourusername/go-bizzmq/queue"
+    "github.com/subhammahanty235/bizzmq-go"
 )
 
 func main() {
     // Initialize with Redis connection string
-    mq, err := queue.NewBizzMQ("redis://localhost:6379")
+    mq, err := bizzmq.NewBizzMQ("redis://localhost:6379")
     if err != nil {
         log.Fatalf("Failed to connect to Redis: %v", err)
     }
@@ -52,7 +53,9 @@ func main() {
     ctx := context.Background()
     
     // Create a queue
-    err = mq.CreateQueue(ctx, "email-queue", queue.QueueOptions{})
+    err = mq.CreateQueue(ctx, "email-queue", bizzmq.QueueOptions{
+        ConfigDeadLetterQueue: true,
+    })
     if err != nil {
         log.Fatalf("Failed to create queue: %v", err)
     }
@@ -64,33 +67,37 @@ func main() {
         "body":    "Thank you for signing up!",
     }
     
-    messageID, err := mq.PublishMessageToQueue(ctx, "email-queue", jobData, queue.MessageOptions{})
+    messageID, err := mq.PublishMessageToQueue(ctx, "email-queue", jobData, bizzmq.MessageOptions{})
     if err != nil {
         log.Fatalf("Failed to publish message: %v", err)
     }
     fmt.Printf("Published message with ID: %s\n", messageID)
     
-    // Process jobs
+    // Start consuming messages
     cleanup, err := mq.ConsumeMessageFromQueue(ctx, "email-queue", func(data map[string]interface{}) error {
-        fmt.Printf("Sending email to %s\n", data["to"])
+        fmt.Printf("Processing message: %v\n", data)
         // Your job processing logic here
-        // sendEmail(data)
-        fmt.Println("Email sent successfully")
         return nil
     })
     if err != nil {
-        log.Fatalf("Failed to consume messages: %v", err)
+        log.Fatalf("Failed to start consumer: %v", err)
     }
+
+    // Handle graceful shutdown
+    sigCh := make(chan os.Signal, 1)
+    signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
     
-    // Keep the application running
-    time.Sleep(60 * time.Second)
+    <-sigCh
+    fmt.Println("Shutting down consumer...")
     
-    // When you're done, call the cleanup function
+    // Call cleanup function
     cleanup()
+    
+    fmt.Println("Consumer shutdown complete")
 }
 ```
 
-### Using Dead Letter Queue
+### Using Dead Letter Queue with Retries
 
 ```go
 package main
@@ -104,12 +111,12 @@ import (
     "os/signal"
     "syscall"
 
-    "github.com/yourusername/go-bizzmq/queue"
+    "github.com/subhammahanty235/bizzmq-go"
 )
 
 func main() {
     // Initialize with Redis connection string
-    mq, err := queue.NewBizzMQ("redis://localhost:6379/0")
+    mq, err := bizzmq.NewBizzMQ("redis://localhost:6379")
     if err != nil {
         log.Fatalf("Failed to connect to Redis: %v", err)
     }
@@ -117,8 +124,8 @@ func main() {
     
     ctx := context.Background()
     
-    // Create a queue with Dead Letter Queue enabled
-    err = mq.CreateQueue(ctx, "email-queue", queue.QueueOptions{
+    // Create a queue with Dead Letter Queue enabled and custom retry settings
+    err = mq.CreateQueue(ctx, "email-queue", bizzmq.QueueOptions{
         ConfigDeadLetterQueue: true,  // Enable DLQ
         MaxRetries:            3,     // Try 3 times before moving to DLQ
     })
@@ -133,9 +140,7 @@ func main() {
         "body":    "Thank you for signing up!",
     }
     
-    messageID, err := mq.PublishMessageToQueue(ctx, "email-queue", jobData, queue.MessageOptions{
-        // Custom message options can be added here
-    })
+    messageID, err := mq.PublishMessageToQueue(ctx, "email-queue", jobData, bizzmq.MessageOptions{})
     if err != nil {
         log.Fatalf("Failed to publish message: %v", err)
     }
@@ -146,16 +151,14 @@ func main() {
         fmt.Printf("Sending email to %s\n", data["to"])
         
         // Simulate failure for demonstration
-        if data["to"] == "user@example.com" {
-            return errors.New("simulated failure sending email")
-        }
-        
-        fmt.Println("Email sent successfully")
-        return nil
+        return errors.New("simulated failure sending email")
     })
     if err != nil {
         log.Fatalf("Failed to consume messages: %v", err)
     }
+    
+    // Let the consumer run for a while so we can observe retries
+    fmt.Println("Consumer running. Press Ctrl+C to stop...")
     
     // Set up graceful shutdown
     sigCh := make(chan os.Signal, 1)
@@ -167,26 +170,21 @@ func main() {
 }
 ```
 
-## Complete Example
+### Working with Dead Letter Queue
 
 ```go
 package main
 
 import (
     "context"
-    "errors"
     "fmt"
     "log"
-    "os"
-    "os/signal"
-    "syscall"
-    "time"
-    "github.com/subhammahanty235/bizzmq-go/queue"
+
+    "github.com/subhammahanty235/bizzmq-go"
 )
 
 func main() {
-    // Initialize the queue system
-    mq, err := queue.NewBizzMQ("redis://localhost:6379/0")
+    mq, err := bizzmq.NewBizzMQ("redis://localhost:6379")
     if err != nil {
         log.Fatalf("Failed to connect to Redis: %v", err)
     }
@@ -194,59 +192,26 @@ func main() {
     
     ctx := context.Background()
     
-    // Create a queue with DLQ enabled
-    err = mq.CreateQueue(ctx, "firstqueue", queue.QueueOptions{
-        ConfigDeadLetterQueue: true,
-        MaxRetries:            3,
-    })
+    // Get messages from the DLQ
+    dlqName := "email-queue_dlq" // DLQs are named as originalQueueName_dlq
+    messagesJSON, err := mq.GetDeadLetterMessages(ctx, dlqName, 10)
     if err != nil {
-        log.Fatalf("Failed to create queue: %v", err)
+        log.Fatalf("Failed to get DLQ messages: %v", err)
     }
     
-    // Prepare job data
-    jobData := map[string]interface{}{
-        "type":      "email-data",
-        "to":        "user@example.com",
-        "subject":   "Welcome to Our Platform!",
-        "body":      "Thank you for joining. We're excited to have you onboard!",
-        "createdAt": time.Now().UnixMilli(),
-        "priority":  "high",
-    }
+    fmt.Println("Failed messages in DLQ:")
+    fmt.Println(messagesJSON)
     
-    // Publish message to queue
-    messageID, err := mq.PublishMessageToQueue(ctx, "firstqueue", jobData, queue.MessageOptions{})
+    // Retry a specific message from the DLQ
+    messageID := "message:1712345678901" // Example message ID
+    success, err := mq.RetryDeadLetterMessage(ctx, "email-queue", messageID)
     if err != nil {
-        log.Fatalf("Failed to publish message: %v", err)
-    }
-    fmt.Printf("Job published successfully with ID: %s\n", messageID)
-    
-    // Set up consumer
-    cleanup, err := mq.ConsumeMessageFromQueue(ctx, "firstqueue", func(data map[string]interface{}) error {
-        to, _ := data["to"].(string)
-        typ, _ := data["type"].(string)
-        
-        fmt.Printf("Processing %s job for %s\n", typ, to)
-        
-        // Simulate sending email
-        if !strings.Contains(to, "@") || strings.Contains(to, "#") {
-            return errors.New("invalid email address")
-        }
-        
-        // Email sent successfully
-        fmt.Printf("Email sent to %s\n", to)
-        return nil
-    })
-    if err != nil {
-        log.Fatalf("Failed to consume messages: %v", err)
+        log.Fatalf("Failed to retry message: %v", err)
     }
     
-    // Set up graceful shutdown
-    sigCh := make(chan os.Signal, 1)
-    signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-    <-sigCh
-    
-    fmt.Println("Shutting down...")
-    cleanup()
+    if success {
+        fmt.Printf("Message %s successfully moved back to the original queue\n", messageID)
+    }
 }
 ```
 
@@ -258,7 +223,7 @@ func main() {
 
 Creates a new BizzMQ instance connected to the specified Redis server.
 
-- `redisURI` (string): Redis connection string (e.g., "redis://localhost:6379/0")
+- `redisURI` (string): Redis connection string (e.g., "redis://localhost:6379")
 - Returns: A BizzMQ instance and any error that occurred during initialization
 
 ### Queue Management
@@ -270,8 +235,8 @@ Creates a new queue. If the queue already exists, this operation is skipped.
 - `ctx` (context.Context): Context for the operation
 - `queueName` (string): Name of the queue to create
 - `options` (QueueOptions): Queue configuration options
-  - `ConfigDeadLetterQueue` (bool): Whether to create a DLQ for this queue (default: false)
-  - `MaxRetries` (int): Maximum number of retry attempts before sending to DLQ (default: 3)
+  - `ConfigDeadLetterQueue` (bool): Whether to create a DLQ for this queue
+  - `MaxRetries` (int): Maximum number of retry attempts before sending to DLQ
   - `Retry` (int): Initial retry count for messages in this queue
 
 #### `PublishMessageToQueue(ctx context.Context, queueName string, message interface{}, options MessageOptions) (string, error)`
@@ -282,6 +247,8 @@ Publishes a message to the specified queue.
 - `queueName` (string): Name of the queue
 - `message` (interface{}): The message/job data to be processed
 - `options` (MessageOptions): Optional message-specific settings
+  - `Priority` (int64): Message priority level
+  - `Retries` (int64): Custom retry setting for this message
 
 Returns the generated message ID and any error that occurred.
 
@@ -292,22 +259,22 @@ Starts consuming messages from the specified queue.
 - `ctx` (context.Context): Context for the operation
 - `queueName` (string): Name of the queue to consume from
 - `handler` (JobHandler): Function to process each message
-  - Called with the message data as a map[string]interface{}
+  - Function signature: `func(message map[string]interface{}) error`
   - Should return an error if processing fails
 
-Returns a cleanup function that should be called to stop consuming and any error that occurred.
+Returns a cleanup function that should be called to stop consuming, and any error that occurred.
 
 ### Dead Letter Queue Management
 
-#### `GetDeadLetterMessages(ctx context.Context, queueName string, limit int) ([]map[string]interface{}, error)`
+#### `GetDeadLetterMessages(ctx context.Context, queueName string, limit int) (string, error)`
 
-Retrieves messages from the dead letter queue without removing them.
+Retrieves messages from the dead letter queue as a JSON string.
 
 - `ctx` (context.Context): Context for the operation
-- `queueName` (string): Name of the original queue
+- `queueName` (string): Name of the DLQ to get messages from
 - `limit` (int): Maximum number of messages to retrieve (default: 100)
 
-Returns an array of failed message objects and any error that occurred.
+Returns a JSON string containing the messages and any error that occurred.
 
 #### `RetryDeadLetterMessage(ctx context.Context, queueName string, messageID string) (bool, error)`
 
@@ -319,22 +286,32 @@ Moves a message from the dead letter queue back to the original queue for retry.
 
 Returns a boolean indicating success and any error that occurred.
 
-## Error Handling
+## Error Handling and Retry Flow
 
-When job processing fails (handler returns an error):
+When a job processing fails (handler returns an error):
 
 1. The error is caught and logged
-2. If retry is enabled, the job retry count is incremented
-3. If retry count < maxRetries, the job is added back to the queue
-4. If retry count >= maxRetries, the job is moved to the DLQ (if enabled)
-5. Error details are preserved with the job for debugging
+2. If retry is enabled and maxRetries > 0:
+   - The job retry count is incremented
+   - The job is added back to the queue
+3. If retry count exceeds maxRetries or retries are disabled:
+   - The job is moved to the Dead Letter Queue (if enabled)
+   - Error details are preserved with the job for debugging
 
 ## Best Practices
 
-1. **Always use context for cancellation**: Pass appropriate context to operations that might need to be cancelled
-2. **Enable Dead Letter Queues** for production workloads to capture failed jobs
-3. **Set appropriate MaxRetries** based on the transient nature of expected failures
-4. **Include relevant metadata** in your job data for easier debugging
-5. **Check your DLQ regularly** for repeated failures that might indicate systemic issues
-6. **Implement graceful shutdown** by calling the cleanup function returned by `ConsumeMessageFromQueue`
-7. **Use defer for cleanup**: Always use `defer mq.Close()` to ensure Redis connections are properly closed
+1. **Always enable Dead Letter Queues** for production workloads to capture failed jobs
+2. **Use appropriate contexts** for proper cancellation and timeouts
+3. **Implement graceful shutdown** by calling the cleanup function returned by `ConsumeMessageFromQueue`
+4. **Set appropriate MaxRetries** based on the nature of expected failures
+5. **Include relevant metadata** in your job data for easier debugging
+6. **Check your DLQ regularly** for repeated failures that might indicate systemic issues
+7. **Always use `defer mq.Close()`** to ensure Redis connections are properly closed
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
