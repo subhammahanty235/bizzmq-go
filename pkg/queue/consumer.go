@@ -146,7 +146,7 @@ func (b *BizzMQ) ConsumeMessageFromQueue(ctx context.Context, queuename string, 
 		cancel()              // Cancel the context to stop all operations
 		fallbackTicker.Stop() // Stop the ticker
 		wg.Wait()             // Wait for all goroutines to finish
-		subscriber.Close()    // Close the subscriber connection
+		subscriber.Close()
 	}, nil
 
 }
