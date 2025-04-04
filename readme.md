@@ -17,7 +17,7 @@ A lightweight Redis-based message queue with Dead Letter Queue support, implemen
 ## Installation
 
 ```bash
-go get github.com/yourusername/go-bizzmq
+go get github.com/subhammahanty235/bizzmq-go
 ```
 
 ## Prerequisites
@@ -181,8 +181,7 @@ import (
     "os/signal"
     "syscall"
     "time"
-
-    "github.com/yourusername/go-bizzmq/queue"
+    "github.com/subhammahanty235/bizzmq-go/queue"
 )
 
 func main() {
@@ -339,7 +338,3 @@ When job processing fails (handler returns an error):
 5. **Check your DLQ regularly** for repeated failures that might indicate systemic issues
 6. **Implement graceful shutdown** by calling the cleanup function returned by `ConsumeMessageFromQueue`
 7. **Use defer for cleanup**: Always use `defer mq.Close()` to ensure Redis connections are properly closed
-
-## License
-
-MIT
