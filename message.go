@@ -1,5 +1,7 @@
 package bizzmq
 
+import "time"
+
 /*
 		this.message_id = message_id
         this.queue_name = queue_name;
@@ -15,9 +17,6 @@ package bizzmq
         this.retries_made = 0;
 
 */
-import (
-	"time"
-)
 
 type MessageOptions struct {
 	Priority int64 `json:"priority"`
@@ -44,6 +43,23 @@ func NewMessage(queueName string, messageID string, message interface{}, options
 		TimestampUpdated: time.Now().UnixMilli(),
 		Status:           "waiting",
 	}
+}
+func (m *Message) UpdateLifeCycleStatus(newStatus string) *Message {
+	validStates := []string{"waiting", "processing", "processed", "failed", "requeued"}
+	isValid := false
+	for _, status := range validStates {
+		if status == newStatus {
+			isValid = true
+			break
+		}
+	}
+
+	if !isValid {
+		return nil
+	}
+	m.Status = newStatus
+	m.TimestampUpdated = time.Now().UnixMilli()
+	return m
 }
 
 func (m *Message) ToJSON() map[string]interface{} {
