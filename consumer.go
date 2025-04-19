@@ -30,9 +30,8 @@ func (b *BizzMQ) ConsumeMessageFromQueue(ctx context.Context, queuename string, 
 		return nil, fmt.Errorf("failed to get queue options: %w", err)
 	}
 
-	deadLetterQueueValue := queueOptionsMap["dead_letter_queue"]
-	useDeadLetterQueue := deadLetterQueueValue == "true" || deadLetterQueueValue == "1"
-
+	deadLetterQueueValue := queueOptionsMap["config_dead_letter_queue"]
+	useDeadLetterQueue := string(deadLetterQueueValue) == "1"
 	maxRetries := 3 // Default value for the retries, TODO: Better approach *
 	if maxRetriesStr, ok := queueOptionsMap["maxRetries"]; ok {
 		if val, err := strconv.Atoi(maxRetriesStr); err == nil {
@@ -46,28 +45,54 @@ func (b *BizzMQ) ConsumeMessageFromQueue(ctx context.Context, queuename string, 
 			return nil
 		}
 
-		var parsedMessage map[string]interface{}
-		if err := json.Unmarshal([]byte(message), &parsedMessage); err != nil {
+		var messageObj Message
+		if err := json.Unmarshal([]byte(message), &messageObj); err != nil {
 			log.Printf("❌ Failed to parse message: %v", err)
+
 			return err
 		}
+		//Lifecycle Update -- wating ---> processing
+		messageObj.UpdateLifeCycleStatus("processing")
 
-		// now it will process the callback function recieved from the client end
-		if err := callback(parsedMessage); err != nil {
+		// Extract the  actual message data to pass to callback
+		messageData := make(map[string]interface{})
+
+		switch m := messageObj.Message.(type) {
+		case map[string]interface{}:
+			messageData = m
+
+		default:
+			// If it's not already a map, put it in a data field
+			messageData["data"] = messageObj.Message
+		}
+
+		if err := callback(messageData); err != nil {
+			//LifeCycle Update --- processing --> failed
+			messageObj.UpdateLifeCycleStatus("failed")
 			if useDeadLetterQueue {
 				if maxRetries > 0 {
 					if err := b.requeueMessage(ctx, queuename, message, err); err != nil {
 						log.Printf("❌ Error retrying message: %v", err)
+
 					}
 				} else {
 					if err := b.moveMessageToDLQ(ctx, queuename, message, err); err != nil {
 						log.Printf("❌ Error moving message to DLQ: %v", err)
+
 					}
 				}
 			} else {
 				log.Printf("⚠️ Message failed but no DLQ configured")
 			}
 			return err
+		} else {
+			//Temp Code for testing
+			if err := b.requeueMessage(ctx, queuename, message, err); err != nil {
+				log.Printf("❌ Error retrying message: %v", err)
+
+			}
+			//LifeCycle Updated --- processing --> processed
+			messageObj.UpdateLifeCycleStatus("processed")
 		}
 
 		return nil
@@ -198,11 +223,18 @@ func (b *BizzMQ) requeueMessage(ctx context.Context, queuename, message interfac
 			return fmt.Errorf("failed to marshal updated message")
 		}
 
+		//Lifecycle Implmentation Code -->
+		var messageObj Message
+		if err := json.Unmarshal([]byte(string(messageJSON)), &messageObj); err != nil {
+			log.Printf("❌ Failed to parse message: %v", err)
+
+			return err
+		}
 		queueKey := fmt.Sprintf("queue:%s", queuename)
 		if err := redisClientInstance.LPush(ctx, queueKey, string(messageJSON)).Err(); err != nil {
 			return fmt.Errorf("failed to push messages back to queue")
 		}
-
+		messageObj.UpdateLifeCycleStatus("requeued")
 		fmt.Printf("🔄 Message Requeued for retry ")
 		return nil
 	} else {
@@ -225,7 +257,7 @@ func (b *BizzMQ) moveMessageToDLQ(ctx context.Context, queuename, message interf
 	}
 
 	deadLetterQueueValue := false
-	if deadLetterQueueValueStr, ok := queueOptionsMap["dead_letter_queue"]; ok {
+	if deadLetterQueueValueStr, ok := queueOptionsMap["config_dead_letter_queue"]; ok {
 		if val, err := strconv.ParseBool(deadLetterQueueValueStr); err == nil {
 			deadLetterQueueValue = val
 		}
@@ -250,8 +282,15 @@ func (b *BizzMQ) moveMessageToDLQ(ctx context.Context, queuename, message interf
 		return fmt.Errorf("❌ Message must be of string or map")
 	}
 
+	var errorMessage string
+	if processingErr != nil {
+		errorMessage = processingErr.Error()
+	} else {
+		errorMessage = "Unknown error"
+	}
+
 	parsedMessage["options"] = map[string]interface{}{
-		"message":   processingErr.Error,
+		"message":   errorMessage,
 		"stack":     string(debug.Stack()),
 		"timestamp": time.Now().UnixMilli(),
 	}

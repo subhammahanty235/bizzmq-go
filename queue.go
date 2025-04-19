@@ -47,8 +47,43 @@ func (b *BizzMQ) CreateQueue(ctx context.Context, queuename string, options Queu
 	if err := redisClientInstance.HSet(ctx, queueMetaKey, queueData).Err(); err != nil {
 		return fmt.Errorf("failed to create queue: %w", err)
 	}
-
 	fmt.Printf("📌 Queue \"%s\" created successfully.\n", queuename)
+	if options.ConfigDeadLetterQueue {
+		dlqName := fmt.Sprintf("%s_dlq", queuename)
+		dlqMetaKey := fmt.Sprintf("queue_meta:%s", dlqName)
+		exists, err := redisClientInstance.Exists(ctx, dlqMetaKey).Result()
+		if err != nil {
+			return fmt.Errorf("failed to check if dlq queue exists: %w", err)
+		}
+		if exists == 1 {
+			fmt.Printf("✅ Dead Letter Queue \"%s\" already exists.\n", queuename)
+			return nil
+		}
+
+		optionsMap := make(map[string]interface{})
+
+		optionsMap["createdAt"] = time.Now().UnixMilli()
+		optionsMap["dead_letter_queue"] = true
+		optionsMap["parentQueue"] = queuename
+
+		if options.Retry > 0 {
+			optionsMap["retry"] = options.Retry
+		} else {
+			optionsMap["retry"] = 0
+		}
+
+		if options.MaxRetries > 0 {
+			optionsMap["maxRetries"] = options.MaxRetries
+		} else {
+			optionsMap["maxRetries"] = 0
+		}
+
+		if err := redisClientInstance.HSet(ctx, dlqMetaKey, optionsMap).Err(); err != nil {
+			return fmt.Errorf("failed to Create DLQ")
+		}
+
+	}
+
 	return nil
 
 }
