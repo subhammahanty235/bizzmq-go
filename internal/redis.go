@@ -51,7 +51,7 @@ func (r *RedisClient) CloseRedisClient() error {
 func PrintWelcomeMessage() {
 	fmt.Println("╔════════════════════════════════════════════════════════════╗")
 	fmt.Println("║                                                            ║")
-	fmt.Println("║   🚀 BizzMQ Queue System v1.0.0 (Early Release)            ║")
+	fmt.Println("║   🚀 BizzMQ Queue System v1.1.0 (Early Release)            ║")
 	fmt.Println("║         A lightweight message queue for go                 ║")
 	fmt.Println("║                                                            ║")
 	fmt.Println("╠════════════════════════════════════════════════════════════╣")
@@ -67,7 +67,7 @@ func PrintWelcomeMessage() {
 	fmt.Println("║       3. Set up consumers                                  ║")
 	fmt.Println("║                                                            ║")
 	fmt.Println("║   📚 For documentation visit:                              ║")
-	fmt.Println("║       github.com/subhammahanty235/bizzmq-go                ║")
+	fmt.Println("║       https://bizzmq.vercel.app/docs/go-docs.html          ║")
 	fmt.Println("║                                                            ║")
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 }
