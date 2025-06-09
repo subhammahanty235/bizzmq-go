@@ -42,7 +42,7 @@ func (b *BizzMQ) StartTicker() {
 func CreateTCPServer() {
 	conn, err := grpc.NewClient("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("did not connect: %v", err)
+		log.Printf("did not connect: %v", err)
 	}
 	fmt.Println("TCP Connection is Running and Ready to process")
 
@@ -53,7 +53,7 @@ func CreateTCPServer() {
 
 	resp, err := client.HeartBeatExchange(ctx, &pb.RequestHeartBeat{InstanceId: "82828", SignalId: "00001"})
 	if err != nil {
-		log.Fatalf("could not exchange heartbeat: %v", err)
+		log.Printf("could not exchange heartbeat: %v", err)
 	}
 	log.Printf(resp.InstanceId)
 }
