@@ -1,0 +1,17 @@
+syntax="proto3";
+package bizzgrpc;
+
+option go_package = "./proto";
+
+service HandShake{
+    rpc HandShakeExchange (SendHandShake) returns (RecievedHandShake);
+}
+
+message SendHandShake{
+    string instancemodule = 1;
+    string instanceid = 2;
+}
+message RecievedHandShake{
+    string instanceid = 1;
+    string message = 2;
+}

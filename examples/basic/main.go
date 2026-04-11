@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/subhammahanty235/bizzmq-go"
 )
@@ -24,27 +25,30 @@ func main() {
 	ctx := context.Background()
 
 	// Create a queue
-	err = mq.CreateQueue(ctx, "email-queue", bizzmq.QueueOptions{
+	err = mq.CreateQueue(ctx, "email-queue-330", bizzmq.QueueOptions{
 		ConfigDeadLetterQueue: true,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create queue: %v", err)
 	}
 
-	jobData := map[string]interface{}{
-		"to":      "user@example.com",
-		"subject": "Welcome to Our Service",
-		"body":    "Thank you for signing up!",
+	for i := 0; i < 5; i++ {
+		jobData := map[string]interface{}{
+			"to":      "subham@example.com" + string(i),
+			"subject": "Welcome to Our Queue----",
+			"body":    "Thank you for Using!",
+		}
+		messageID, err := mq.PublishMessageToQueue(ctx, "email-queue-330", jobData, bizzmq.MessageOptions{})
+		if err != nil {
+			log.Fatalf("Failed to publish message: %v", err)
+		}
+		fmt.Printf("Published message with ID: %s\n", messageID)
+		time.Sleep(1500 * time.Millisecond)
 	}
 
-	messageID, err := mq.PublishMessageToQueue(ctx, "email-queue", jobData, bizzmq.MessageOptions{})
-	if err != nil {
-		log.Fatalf("Failed to publish message: %v", err)
-	}
-	fmt.Printf("Published message with ID: %s\n", messageID)
-
-	cleanup, err := mq.ConsumeMessageFromQueue(ctx, "email-queue", func(data map[string]interface{}) error {
+	cleanup, err := mq.ConsumeMessageFromQueue(ctx, "email-queue-330", func(data map[string]interface{}) error {
 		fmt.Printf("Processing message: %v\n", data)
+		time.Sleep(1500 * time.Millisecond)
 		return nil
 	})
 	if err != nil {

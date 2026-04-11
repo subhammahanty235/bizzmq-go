@@ -20,8 +20,9 @@ type Server struct {
 }
 
 type BizzMQ struct {
-	redis *internal.RedisClient
-	stop  chan struct{}
+	redis    *internal.RedisClient
+	stop     chan struct{}
+	grpcConn *grpc.ClientConn
 }
 
 func (b *BizzMQ) StartTicker() {
@@ -31,7 +32,7 @@ func (b *BizzMQ) StartTicker() {
 	for {
 		select {
 		case <-ticker.C:
-			CreateTCPServer()
+			b.CreateTCPServerHeartBeat()
 		case <-b.stop:
 			fmt.Println("Stopping ticker")
 			return
@@ -39,23 +40,50 @@ func (b *BizzMQ) StartTicker() {
 	}
 }
 
-func CreateTCPServer() {
-	conn, err := grpc.NewClient("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Printf("did not connect: %v", err)
-	}
-	fmt.Println("TCP Connection is Running and Ready to process")
-
-	defer conn.Close()
+func (b *BizzMQ) CreateTCPServerHeartBeat() {
+	// conn, err := grpc.NewClient("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// if err != nil {
+	// 	log.Printf("did not connect: %v", err)
+	// }
+	// fmt.Println("TCP Connection is Running and Ready to process")
+	conn := b.grpcConn
 	client := pb.NewHeartBeatClient(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
-	resp, err := client.HeartBeatExchange(ctx, &pb.RequestHeartBeat{InstanceId: "82828", SignalId: "00001"})
+	_, err := client.HeartBeatExchange(ctx, &pb.RequestHeartBeat{InstanceId: "82828", SignalId: "00001"})
 	if err != nil {
 		log.Printf("could not exchange heartbeat: %v", err)
 	}
-	log.Printf(resp.InstanceId)
+
+}
+
+func (b *BizzMQ) SendTCPServerHandShakeRequest() bool {
+	conn := b.grpcConn
+	//loop based retry mechinism
+	for i := 0; i < 3; i++ {
+		client := pb.NewHandShakeClient(conn)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
+
+		resp, err := client.HandShakeExchange(ctx, &pb.SendHandShake{Instanceid: "82828", Instancemodule: "Go-Package"})
+		if err != nil {
+			log.Printf("could not connect handshake :%v", err)
+			if i < 4 {
+				log.Printf("Retrying in %v...", (2 * time.Second))
+				time.Sleep(2 * time.Second)
+			}
+			continue
+		}
+
+		log.Printf(resp.Message)
+		if resp.Instanceid == "82828" {
+			return true
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+	return false
 }
 
 func NewBizzMQ(redisUri string) (*BizzMQ, error) {
@@ -67,10 +95,15 @@ func NewBizzMQ(redisUri string) (*BizzMQ, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
+	conn, err := grpc.NewClient("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Printf("did not connect: %v", err)
+	}
 
 	b := &BizzMQ{
-		redis: redisInstance,
-		stop:  make(chan struct{}),
+		redis:    redisInstance,
+		stop:     make(chan struct{}),
+		grpcConn: conn,
 	}
 	flag := true
 	if flag {
@@ -85,5 +118,12 @@ func NewBizzMQ(redisUri string) (*BizzMQ, error) {
 }
 
 func (b *BizzMQ) Close() error {
+	close(b.stop)
+
+	if b.grpcConn != nil {
+		if err := b.grpcConn.Close(); err != nil {
+			log.Printf("error closing gRPC connection: %v", err)
+		}
+	}
 	return b.redis.CloseRedisClient()
 }

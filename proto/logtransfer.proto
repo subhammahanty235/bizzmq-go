@@ -1,0 +1,18 @@
+syntax="proto3";
+package bizzgrpc;
+
+option go_package = "./proto";
+
+service LiveLogs{
+    rpc LiveLogsTransfer (stream SendLogData) returns (RecieveAck);
+}
+
+message SendLogData{
+    string logs = 1;
+}
+
+message RecieveAck{
+    string acknowledgment = 1;
+    int64 logCount = 2;
+}
+

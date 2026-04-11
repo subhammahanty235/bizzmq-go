@@ -1,0 +1,19 @@
+syntax="proto3";
+package bizzgrpc;
+
+option go_package= "./proto";
+
+service HeartBeat{
+    rpc HeartBeatExchange (RequestHeartBeat) returns (ReplyHeartBeat);
+}
+
+message RequestHeartBeat{
+    string instanceId = 1;
+    string signalId = 2;
+}
+
+message ReplyHeartBeat{
+    string instanceId = 1;
+    string signalId = 2;
+}
+

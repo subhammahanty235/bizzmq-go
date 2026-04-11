@@ -1,6 +1,9 @@
 package bizzmq
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 /*
 		this.message_id = message_id
@@ -31,6 +34,7 @@ type Message struct {
 	TimestampCreated int64          `json:"timestamp_created"`
 	TimestampUpdated int64          `json:"timestamp_updated"`
 	Status           string         `json:"status"`
+	RetriesMade      int            `json:"retries_made"`
 }
 
 func NewMessage(queueName string, messageID string, message interface{}, options MessageOptions) *Message {
@@ -42,24 +46,19 @@ func NewMessage(queueName string, messageID string, message interface{}, options
 		TimestampCreated: time.Now().UnixMilli(),
 		TimestampUpdated: time.Now().UnixMilli(),
 		Status:           "waiting",
+		RetriesMade:      0,
 	}
 }
-func (m *Message) UpdateLifeCycleStatus(newStatus string) *Message {
+func (m *Message) UpdateLifeCycleStatus(newStatus string) error {
 	validStates := []string{"waiting", "processing", "processed", "failed", "requeued"}
-	isValid := false
 	for _, status := range validStates {
 		if status == newStatus {
-			isValid = true
-			break
+			m.Status = newStatus
+			m.TimestampUpdated = time.Now().UnixMilli()
+			return nil
 		}
 	}
-
-	if !isValid {
-		return nil
-	}
-	m.Status = newStatus
-	m.TimestampUpdated = time.Now().UnixMilli()
-	return m
+	return fmt.Errorf("invalid status %q: must be one of %v", newStatus, validStates)
 }
 
 func (m *Message) ToJSON() map[string]interface{} {
@@ -71,5 +70,6 @@ func (m *Message) ToJSON() map[string]interface{} {
 		"timestamp_created": m.TimestampCreated,
 		"timestamp_updated": m.TimestampUpdated,
 		"status":            m.Status,
+		"retries_made":      m.RetriesMade,
 	}
 }

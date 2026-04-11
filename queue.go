@@ -44,6 +44,11 @@ func (b *BizzMQ) CreateQueue(ctx context.Context, queuename string, options Queu
 		queueData[k] = v
 	}
 
+	// Store dead_letter_queue flag using the canonical key so both Go and Node.js SDKs can read it.
+	if options.ConfigDeadLetterQueue {
+		queueData["dead_letter_queue"] = true
+	}
+
 	if err := redisClientInstance.HSet(ctx, queueMetaKey, queueData).Err(); err != nil {
 		return fmt.Errorf("failed to create queue: %w", err)
 	}
@@ -105,8 +110,7 @@ func (b *BizzMQ) GetDeadLetterMessages(ctx context.Context, queuename string, li
 		return "❌ Error while ferching dead letter queue.", fmt.Errorf("❌ Error while ferching dead letter queue")
 	}
 
-	messages, err := redisClientInstance.LRange(ctx, dlqKey, 0, int64(limit-1)).Result()
-
+	messages, err := redisClientInstance.ZRange(ctx, dlqKey, 0, int64(limit-1)).Result()
 	if err != nil {
 		return "❌ Error while fetching dead letter messages", fmt.Errorf("❌ Error while fetching dead letter messages: %v", err)
 	}
@@ -133,8 +137,7 @@ func (b *BizzMQ) RetryDeadLetterMessage(ctx context.Context, queuename string, m
 	if err != nil {
 		return false, fmt.Errorf("❌ Error while ferching dead letter queue")
 	}
-	messages, err := redisClientInstance.LRange(ctx, dlqKey, 0, -1).Result()
-
+	messages, err := redisClientInstance.ZRange(ctx, dlqKey, 0, -1).Result()
 	if err != nil {
 		return false, fmt.Errorf("failed to get messages from DLQ")
 	}
@@ -142,15 +145,15 @@ func (b *BizzMQ) RetryDeadLetterMessage(ctx context.Context, queuename string, m
 	for _, messageStr := range messages {
 		var message map[string]interface{}
 		if err := json.Unmarshal([]byte(messageStr), &message); err != nil {
-			//we will skip all malformed messages
+			// skip malformed messages
 			continue
 		}
 
-		msgId, _ := message["message_Id"].(string)
+		msgId, _ := message["message_id"].(string)
 		if msgId == messageId {
-			removed, err := redisClientInstance.LRem(ctx, dlqKey, 1, messageStr).Result()
+			removed, err := redisClientInstance.ZRem(ctx, dlqKey, messageStr).Result()
 			if err != nil {
-				return false, fmt.Errorf("failed tp remove message from DLQ")
+				return false, fmt.Errorf("failed to remove message from DLQ")
 			}
 
 			if removed == 0 {

@@ -10,10 +10,43 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	pb "github.com/subhammahanty235/bizzmq-go/proto"
 )
 
 type JobHandler func(message map[string]interface{}) error
 type ConsumerCleanup func()
+
+type Log struct {
+	Queuename      string
+	MessageId      string
+	ProcessingTime string
+	Status         string
+}
+
+func NewLog(queuename string, messageId string, processingtime string, status string) *Log {
+	return &Log{
+		Queuename:      queuename,
+		MessageId:      messageId,
+		ProcessingTime: processingtime,
+		Status:         status,
+	}
+}
+
+func (l *Log) ToString() string {
+	return fmt.Sprintf(
+		"Queue: %s | Message ID: %s | Processing Time: %s | Status: %s",
+		l.Queuename,
+		l.MessageId,
+		l.ProcessingTime,
+		l.Status,
+	)
+}
+
+// isDLQEnabled normalises the Redis-stored boolean value for dead_letter_queue.
+// Node.js ioredis stores booleans as "true"/"false"; Go redis client stores them as "1"/"0".
+func isDLQEnabled(val string) bool {
+	return val == "1" || val == "true"
+}
 
 func (b *BizzMQ) ConsumeMessageFromQueue(ctx context.Context, queuename string, callback JobHandler) (ConsumerCleanup, error) {
 	if queuename == "" {
@@ -22,93 +55,98 @@ func (b *BizzMQ) ConsumeMessageFromQueue(ctx context.Context, queuename string, 
 
 	queueKey := fmt.Sprintf("queue:%s", queuename)
 	queueMetaKey := fmt.Sprintf("queue_meta:%s", queuename)
-
 	redisClient := b.redis.GetRedisClient()
 	subscriber := redis.NewClient(redisClient.Options())
+
 	queueOptionsMap, err := redisClient.HGetAll(ctx, queueMetaKey).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queue options: %w", err)
 	}
 
-	deadLetterQueueValue := queueOptionsMap["config_dead_letter_queue"]
-	useDeadLetterQueue := string(deadLetterQueueValue) == "1"
-	maxRetries := 3 // Default value for the retries, TODO: Better approach *
+	useDeadLetterQueue := isDLQEnabled(queueOptionsMap["dead_letter_queue"]) ||
+		isDLQEnabled(queueOptionsMap["config_dead_letter_queue"])
+
+	maxRetries := 3
 	if maxRetriesStr, ok := queueOptionsMap["maxRetries"]; ok {
 		if val, err := strconv.Atoi(maxRetriesStr); err == nil {
 			maxRetries = val
 		}
 	}
 
-	// This function will process the jobs/messages
-	processJob := func(message string) error {
-		if message == "" {
+	stream, err := pb.NewLiveLogsClient(b.grpcConn).LiveLogsTransfer(ctx)
+	if err != nil {
+		log.Printf("❌ Failed to open gRPC log stream: %v", err)
+		return nil, err
+	}
+
+	processJob := func(messageStr string) error {
+		if messageStr == "" {
 			return nil
 		}
 
 		var messageObj Message
-		if err := json.Unmarshal([]byte(message), &messageObj); err != nil {
+		if err := json.Unmarshal([]byte(messageStr), &messageObj); err != nil {
 			log.Printf("❌ Failed to parse message: %v", err)
-
 			return err
 		}
-		//Lifecycle Update -- wating ---> processing
-		messageObj.UpdateLifeCycleStatus("processing")
 
-		// Extract the  actual message data to pass to callback
+		if err := messageObj.UpdateLifeCycleStatus("processing"); err != nil {
+			log.Printf("❌ Invalid lifecycle transition: %v", err)
+		}
+
 		messageData := make(map[string]interface{})
-
 		switch m := messageObj.Message.(type) {
 		case map[string]interface{}:
 			messageData = m
-
 		default:
-			// If it's not already a map, put it in a data field
 			messageData["data"] = messageObj.Message
 		}
 
 		if err := callback(messageData); err != nil {
-			//LifeCycle Update --- processing --> failed
-			messageObj.UpdateLifeCycleStatus("failed")
+			if lerr := messageObj.UpdateLifeCycleStatus("failed"); lerr != nil {
+				log.Printf("❌ Invalid lifecycle transition: %v", lerr)
+			}
 			if useDeadLetterQueue {
 				if maxRetries > 0 {
-					if err := b.requeueMessage(ctx, queuename, message, err); err != nil {
-						log.Printf("❌ Error retrying message: %v", err)
-
+					if reqErr := b.requeueMessage(ctx, queuename, messageStr, err); reqErr != nil {
+						log.Printf("❌ Error retrying message: %v", reqErr)
 					}
 				} else {
-					if err := b.moveMessageToDLQ(ctx, queuename, message, err); err != nil {
-						log.Printf("❌ Error moving message to DLQ: %v", err)
-
+					if dlqErr := b.moveMessageToDLQ(ctx, queuename, messageStr, err); dlqErr != nil {
+						log.Printf("❌ Error moving message to DLQ: %v", dlqErr)
 					}
 				}
 			} else {
 				log.Printf("⚠️ Message failed but no DLQ configured")
 			}
 			return err
-		} else {
-			//Temp Code for testing
-			if err := b.requeueMessage(ctx, queuename, message, err); err != nil {
-				log.Printf("❌ Error retrying message: %v", err)
+		}
 
-			}
-			//LifeCycle Updated --- processing --> processed
-			messageObj.UpdateLifeCycleStatus("processed")
+		if lerr := messageObj.UpdateLifeCycleStatus("processed"); lerr != nil {
+			log.Printf("❌ Invalid lifecycle transition: %v", lerr)
+		}
+
+		strlog := NewLog(queuename, messageObj.MessageID, time.Now().GoString(), messageObj.Status).ToString()
+		if err := stream.Send(&pb.SendLogData{Logs: strlog}); err != nil {
+			log.Printf("❌ Failed to send log over gRPC stream: %v", err)
 		}
 
 		return nil
 	}
 
-	// we will check if any existing messages are there in the queue for processing, we will process them first
+	// Pop and process all existing messages in priority order (lowest score = highest priority).
 	processExistingJobs := func() {
 		for {
-			message, err := redisClient.RPop(ctx, queueKey).Result()
-			if err != nil {
-				if err != redis.Nil {
-					log.Printf("❌ Error popping message from queue: %v", err)
-				}
+			entries, err := redisClient.ZRange(ctx, queueKey, 0, 0).Result()
+			if err != nil || len(entries) == 0 {
 				break
 			}
-
+			message := entries[0]
+			removed, err := redisClient.ZRem(ctx, queueKey, message).Result()
+			if err != nil || removed == 0 {
+				// Another consumer grabbed it first — that's fine.
+				break
+			}
 			if err := processJob(message); err != nil {
 				log.Printf("❌ Error processing message: %v", err)
 			}
@@ -119,49 +157,23 @@ func (b *BizzMQ) ConsumeMessageFromQueue(ctx context.Context, queuename string, 
 
 	pubsub := subscriber.Subscribe(ctx, queueKey)
 
-	// go routine for start checking for messages
 	go func() {
 		defer pubsub.Close()
-
-		channel := pubsub.Channel()
-		for msg := range channel {
-			log.Printf("🔔 New job notification received: %s", msg.Payload)
-
-			//queue mechanism to pop and process one message
-			message, err := redisClient.RPop(ctx, queueKey).Result()
-			if err == nil {
-				if err := processJob(message); err != nil {
-					log.Printf("❌ Error processing message: %v", err)
-				}
-			} else if err != redis.Nil {
-				log.Printf("❌ Error popping message after notification: %v", err)
-			}
+		for range pubsub.Channel() {
+			// Drain all messages that may have accumulated since the notification.
+			processExistingJobs()
 		}
 	}()
 
-	//interval timer
 	fallbackTicker := time.NewTicker(5 * time.Second)
-
 	go func() {
 		for range fallbackTicker.C {
-			message, err := redisClient.RPop(ctx, queueKey).Result()
-			if err == nil {
-				log.Printf("⚠️ Fallback found unprocessed job")
-
-				if err := processJob(message); err != nil {
-					log.Printf("❌ Error processing message from fallback: %v", err)
-				}
-
-				processExistingJobs()
-			} else if err != redis.Nil {
-				log.Printf("❌ Error in fallback check: %v", err)
-			}
+			processExistingJobs()
 		}
 	}()
 
 	log.Printf("📡 Listening for jobs on %s...", queuename)
 
-	//cleanup funcrions
 	return func() {
 		fallbackTicker.Stop()
 		pubsub.Close()
@@ -169,8 +181,9 @@ func (b *BizzMQ) ConsumeMessageFromQueue(ctx context.Context, queuename string, 
 	}, nil
 }
 
-func (b *BizzMQ) requeueMessage(ctx context.Context, queuename, message interface{}, processingErr error) error {
+func (b *BizzMQ) requeueMessage(ctx context.Context, queuename string, message interface{}, processingErr error) error {
 	queueMetaKey := fmt.Sprintf("queue_meta:%s", queuename)
+	queueKey := fmt.Sprintf("queue:%s", queuename)
 	redisClientInstance := b.redis.GetRedisClient()
 
 	queueOptionsMap, err := redisClientInstance.HGetAll(ctx, queueMetaKey).Result()
@@ -185,37 +198,35 @@ func (b *BizzMQ) requeueMessage(ctx context.Context, queuename, message interfac
 		}
 	}
 
-	//get the retry count
 	var parsedMessage map[string]interface{}
-
 	switch msg := message.(type) {
 	case string:
 		if err := json.Unmarshal([]byte(msg), &parsedMessage); err != nil {
-			return fmt.Errorf("❌ Failed to parse message: %v", err)
+			return fmt.Errorf("failed to parse message: %v", err)
 		}
 	case map[string]interface{}:
 		parsedMessage = msg
-
 	default:
-		return fmt.Errorf("❌ Message must be of string or map")
+		return fmt.Errorf("message must be a string or map")
 	}
 
-	var retryCount int
-	if options, ok := parsedMessage["options"].(map[string]interface{}); ok {
-		if count, ok := options["retryCount"].(float64); ok {
-			retryCount = int(count)
-		}
+	// Read retries_made directly from the top-level field (matching Node.js).
+	retriesMade := 0
+	if v, ok := parsedMessage["retries_made"].(float64); ok {
+		retriesMade = int(v)
 	}
+	retriesMade++
 
-	retryCount++
-	if retryCount <= maxRetries {
+	if retriesMade <= maxRetries {
+		parsedMessage["retries_made"] = retriesMade
+		parsedMessage["timestamp_updated"] = time.Now().UnixMilli()
+
 		options, _ := parsedMessage["options"].(map[string]interface{})
 		if options == nil {
 			options = make(map[string]interface{})
 		}
-
-		options["retryCount"] = retryCount
-		options["timestamp_updated"] = time.Now().UnixMilli()
+		options["lastError"] = processingErr.Error()
+		options["retryTimestamp"] = time.Now().UnixMilli()
 		parsedMessage["options"] = options
 
 		messageJSON, err := json.Marshal(parsedMessage)
@@ -223,47 +234,39 @@ func (b *BizzMQ) requeueMessage(ctx context.Context, queuename, message interfac
 			return fmt.Errorf("failed to marshal updated message")
 		}
 
-		//Lifecycle Implmentation Code -->
-		var messageObj Message
-		if err := json.Unmarshal([]byte(string(messageJSON)), &messageObj); err != nil {
-			log.Printf("❌ Failed to parse message: %v", err)
+		priority := float64(0)
+		if p, ok := options["priority"].(float64); ok {
+			priority = p
+		}
+		score := priority*1e10 + float64(time.Now().UnixMilli())
 
-			return err
-		}
-		queueKey := fmt.Sprintf("queue:%s", queuename)
-		if err := redisClientInstance.LPush(ctx, queueKey, string(messageJSON)).Err(); err != nil {
-			return fmt.Errorf("failed to push messages back to queue")
-		}
-		messageObj.UpdateLifeCycleStatus("requeued")
-		fmt.Printf("🔄 Message Requeued for retry ")
-		return nil
-	} else {
-		err = b.moveMessageToDLQ(ctx, queuename, parsedMessage, processingErr)
-		if err != nil {
-			return fmt.Errorf("failed to publish message to queue")
+		if err := redisClientInstance.ZAdd(ctx, queueKey, &redis.Z{
+			Score:  score,
+			Member: string(messageJSON),
+		}).Err(); err != nil {
+			return fmt.Errorf("failed to requeue message")
 		}
 
+		log.Printf("🔄 Message requeued (attempt %d/%d)", retriesMade, maxRetries)
 		return nil
 	}
+
+	return b.moveMessageToDLQ(ctx, queuename, parsedMessage, processingErr)
 }
 
-func (b *BizzMQ) moveMessageToDLQ(ctx context.Context, queuename, message interface{}, processingErr error) error {
+func (b *BizzMQ) moveMessageToDLQ(ctx context.Context, queuename string, message interface{}, processingErr error) error {
 	queueMetaKey := fmt.Sprintf("queue_meta:%s", queuename)
 	redisClientInstance := b.redis.GetRedisClient()
-	queueOptionsMap, err := redisClientInstance.HGetAll(ctx, queueMetaKey).Result()
 
+	queueOptionsMap, err := redisClientInstance.HGetAll(ctx, queueMetaKey).Result()
 	if err != nil {
 		return fmt.Errorf("failed to get queue options")
 	}
 
-	deadLetterQueueValue := false
-	if deadLetterQueueValueStr, ok := queueOptionsMap["config_dead_letter_queue"]; ok {
-		if val, err := strconv.ParseBool(deadLetterQueueValueStr); err == nil {
-			deadLetterQueueValue = val
-		}
-	}
-	if !deadLetterQueueValue {
-		fmt.Println("No Dead Letter Queue configured for this Queue, Failed message discarded")
+	dlqEnabled := isDLQEnabled(queueOptionsMap["dead_letter_queue"]) ||
+		isDLQEnabled(queueOptionsMap["config_dead_letter_queue"])
+	if !dlqEnabled {
+		log.Printf("⚠️ No Dead Letter Queue configured for \"%s\". Failed message discarded.", queuename)
 		return nil
 	}
 
@@ -273,58 +276,51 @@ func (b *BizzMQ) moveMessageToDLQ(ctx context.Context, queuename, message interf
 	switch msg := message.(type) {
 	case string:
 		if err := json.Unmarshal([]byte(msg), &parsedMessage); err != nil {
-			return fmt.Errorf("❌ Failed to parse message: %v", err)
+			return fmt.Errorf("failed to parse message: %v", err)
 		}
 	case map[string]interface{}:
-		parsedMessage = msg
-
+		// Copy so we don't mutate the caller's map.
+		parsedMessage = make(map[string]interface{}, len(msg))
+		for k, v := range msg {
+			parsedMessage[k] = v
+		}
 	default:
-		return fmt.Errorf("❌ Message must be of string or map")
+		return fmt.Errorf("message must be a string or map")
 	}
 
-	var errorMessage string
-	if processingErr != nil {
-		errorMessage = processingErr.Error()
-	} else {
-		errorMessage = "Unknown error"
+	// Preserve original options before attaching error metadata.
+	originalOptions, _ := parsedMessage["options"].(map[string]interface{})
+	dlqOptions := make(map[string]interface{})
+	for k, v := range originalOptions {
+		dlqOptions[k] = v
 	}
-
-	parsedMessage["options"] = map[string]interface{}{
-		"message":   errorMessage,
+	dlqOptions["originalQueue"] = queuename
+	dlqOptions["failedAt"] = time.Now().UnixMilli()
+	dlqOptions["error"] = map[string]interface{}{
+		"message":   processingErr.Error(),
 		"stack":     string(debug.Stack()),
 		"timestamp": time.Now().UnixMilli(),
 	}
 
 	var messageData interface{}
-	if data, ok := parsedMessage["data"]; ok {
+	if data, ok := parsedMessage["message"]; ok {
 		messageData = data
 	} else {
-		messageData = map[string]interface{}{"error": "No data found in original message"}
+		messageData = map[string]interface{}{"error": "no data found in original message"}
 	}
-
-	options := make(map[string]interface{})
-	if opts, ok := parsedMessage["options"].(map[string]interface{}); ok {
-		for k, v := range opts {
-			options[k] = v
-		}
-	}
-
-	options["originalQueue"] = queuename
-	options["failedAt"] = time.Now().UnixMilli()
 
 	msgOptions := MessageOptions{}
-	optionsJson, err := json.Marshal(options)
+	optionsJSON, err := json.Marshal(dlqOptions)
 	if err != nil {
-		return fmt.Errorf("failed to marshal options")
+		return fmt.Errorf("failed to marshal DLQ options")
+	}
+	if err := json.Unmarshal(optionsJSON, &msgOptions); err != nil {
+		return fmt.Errorf("failed to unmarshal DLQ options")
 	}
 
-	if err := json.Unmarshal(optionsJson, &msgOptions); err != nil {
-		return fmt.Errorf("failed to unmarshal options to Message Options")
+	if _, err := b.PublishMessageToQueue(ctx, dlqName, messageData, msgOptions); err != nil {
+		return fmt.Errorf("failed to publish message to DLQ: %w", err)
 	}
 
-	_, err = b.PublishMessageToQueue(ctx, dlqName, messageData, msgOptions)
-	if err != nil {
-		return fmt.Errorf("failed to publish message to DLQ")
-	}
 	return nil
 }

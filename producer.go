@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/go-redis/redis/v8"
 )
 
 func (b *BizzMQ) PublishMessageToQueue(ctx context.Context, queuename string, message interface{}, options MessageOptions) (string, error) {
@@ -30,7 +32,12 @@ func (b *BizzMQ) PublishMessageToQueue(ctx context.Context, queuename string, me
 		return "", fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	if err := redisClientInstance.LPush(ctx, queueKey, string(messageJSON)).Err(); err != nil {
+	timestamp := float64(time.Now().UnixMilli())
+	score := float64(options.Priority)*1e10 + timestamp
+	if err := redisClientInstance.ZAdd(ctx, queueKey, &redis.Z{
+		Score:  score,
+		Member: string(messageJSON),
+	}).Err(); err != nil {
 		return "", fmt.Errorf("failed to push message to queue: %w", err)
 	}
 
